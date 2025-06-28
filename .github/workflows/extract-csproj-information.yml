@@ -19,7 +19,7 @@ on:
 
 jobs:
   extract_information:
-    name: '🔍 Extract release information'
+    name: '🔍 Extract csproj information'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.extract_version.outputs.version }}
