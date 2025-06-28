@@ -64,15 +64,13 @@ jobs:
 
           echo "Extracted and Resolved AssemblyVersion: $assemblyVersion"
           echo "Extracted and Resolved Version: $version"
-          echo "Version=$version" >> $GITHUB_OUTPUT
+          echo "$version" >> $GITHUB_OUTPUT
 
       # 📝 Parse changelog for the version
       - name: 📝 Parse changelog
         id: parse_changelog
-        env:
-          VERSION: ${{ steps.extract_version.outputs.version }}
         run: |
-          version=${{ env.VERSION }}
+          version=${{ steps.extract_version.outputs.version }}
           echo "Looking for version: $version"
 
           # Create pattern that matches:
@@ -121,4 +119,4 @@ jobs:
           # Escape newlines and quotes for proper JSON output
           changelog="${changelog//$'\n'/'%0A'}"
           changelog="${changelog//'"'/'\"'}"
-          echo "Changelog=$changelog" >> $GITHUB_OUTPUT
+          echo "$changelog" >> $GITHUB_OUTPUT
