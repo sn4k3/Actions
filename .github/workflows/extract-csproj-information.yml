@@ -64,7 +64,7 @@ jobs:
 
           echo "Extracted and Resolved AssemblyVersion: $assemblyVersion"
           echo "Extracted and Resolved Version: $version"
-          echo "$version" >> $GITHUB_OUTPUT
+          echo "version=$version" >> $GITHUB_OUTPUT
 
       # 📝 Parse changelog for the version
       - name: 📝 Parse changelog
@@ -119,4 +119,4 @@ jobs:
           # Escape newlines and quotes for proper JSON output
           changelog="${changelog//$'\n'/'%0A'}"
           changelog="${changelog//'"'/'\"'}"
-          echo "$changelog" >> $GITHUB_OUTPUT
+          echo "changelog=$changelog" >> $GITHUB_OUTPUT
