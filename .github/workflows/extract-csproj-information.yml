@@ -56,6 +56,11 @@ jobs:
             version="$assemblyVersion"
           fi
 
+          # Replace $(AssemblyVersion) varname in version with the value of assemblyVersion
+          if [ ! -z "$assemblyVersion" ]; then
+            version=$(echo "$version" | sed "s/\$(AssemblyVersion)/$assemblyVersion/g")
+          fi
+
           # Ensure version is valid
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.?[0-9]+)?)?$ ]]; then
             echo "::error::Invalid version format in $project_file: $version"
