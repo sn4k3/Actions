@@ -1,0 +1,124 @@
+name: Extract Release Information
+
+on:
+  workflow_call:
+    inputs:
+      csproj-path:
+        description: "Path to the .csproj or .props file (defaults to Directory.Build.props)"
+        required: false
+        default: "Directory.Build.props"
+        type: string
+        
+    outputs:
+      version:
+        description: "The extracted version number"
+        value: ${{ jobs.extract_information.outputs.version }}
+      changelog:
+        description: "The extracted changelog content"
+        value: ${{ jobs.extract_information.outputs.changelog }}
+
+jobs:
+  extract_information:
+    name: '🔍 Extract release information'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract_version.outputs.version }}
+      changelog: ${{ steps.parse_changelog.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 🔍 Extract Version from project file
+      - name: 🔍 Extract Version
+        id: extract_version
+        run: |
+          project_file="${{ inputs.csproj-path }}"
+          echo "Looking for version in: $project_file"
+
+          # Check for project file
+          if [ ! -f "$project_file" ]; then
+            echo "::error::$project_file file not found."
+            exit 1
+          fi
+
+          # Extract AssemblyVersion
+          assemblyVersion=$(grep -oP '(?<=<AssemblyVersion>).*?(?=</AssemblyVersion>)' "$project_file" || true)
+
+          # Extract Version
+          version=$(grep -oP '(?<=<Version>).*?(?=</Version>)' "$project_file" || true)
+
+          if [ -z "$version" -a -z "$assemblyVersion" ]; then
+            echo "::error::Unable to extract the project version from $project_file."
+            exit 1
+          fi
+
+          # If Version not found, use AssemblyVersion
+          if [ -z "$version" ]; then
+            version="$assemblyVersion"
+          fi
+
+          # Ensure version is valid
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.?[0-9]+)?)?$ ]]; then
+            echo "::error::Invalid version format in $project_file: $version"
+            exit 1
+          fi
+
+          echo "Extracted and Resolved AssemblyVersion: $assemblyVersion"
+          echo "Extracted and Resolved Version: $version"
+          echo "Version=$version" >> $GITHUB_OUTPUT
+
+      # 📝 Parse changelog for the version
+      - name: 📝 Parse changelog
+        id: parse_changelog
+        env:
+          VERSION: ${{ steps.extract_version.outputs.version }}
+        run: |
+          version=${{ env.VERSION }}
+          echo "Looking for version: $version"
+
+          # Create pattern that matches:
+          # - Normal versions: # v1.1.1 (24/05/2025)
+          # - Prerelease versions: # v1.1.1-beta.1 (24/05/2025) or # v1.1.1-rc (24/05/2025)
+          version_pattern="^# v?${version//./\\.}(-[a-zA-Z]+(\.?[0-9]+)?)? \([0-9]{2}/[0-9]{2}/[0-9]{4}\)$"
+          echo "Using pattern: '$version_pattern'"
+
+          # Debug: Show matching lines
+          echo "Matching lines in CHANGELOG.md:"
+          grep -En "$version_pattern" CHANGELOG.md || echo "No matches found"
+
+          # Find the line number using extended regex
+          start_line=$(grep -En "$version_pattern" CHANGELOG.md | cut -d: -f1)
+
+          if [ -z "$start_line" ]; then
+            echo "::error::Could not find version $version in CHANGELOG.md"
+            echo "First few lines of CHANGELOG.md:"
+            head -n 5 CHANGELOG.md
+            exit 1
+          fi
+
+          # Find next version header (with prerelease support)
+          next_version_pattern="^# v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z]+(\.[0-9]+)?)? "
+          next_version_line=$(tail -n +$((start_line+1)) CHANGELOG.md | grep -En -m 1 "$next_version_pattern" | cut -d: -f1)
+
+          if [ -z "$next_version_line" ]; then
+            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md)
+          else
+            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md | head -n $((next_version_line-1)))
+          fi
+
+          # Clean up the changelog content
+          changelog=$(echo "$changelog" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+
+          if [ -z "$changelog" ]; then
+            echo "::error::Empty changelog for version $version"
+            exit 1
+          fi
+
+          echo "Extracted changelog content:"
+          echo "---"
+          echo "$changelog"
+          echo "---"
+
+          # Escape newlines and quotes for proper JSON output
+          changelog="${changelog//$'\n'/'%0A'}"
+          changelog="${changelog//'"'/'\"'}"
+          echo "Changelog=$changelog" >> $GITHUB_OUTPUT
