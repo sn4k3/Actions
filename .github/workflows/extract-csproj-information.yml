@@ -122,6 +122,8 @@ jobs:
           echo "---"
 
           # Escape newlines and quotes for proper JSON output
-          #changelog="${changelog//$'\n'/'%0A'}"
-          #changelog="${changelog//'"'/'\"'}"
-          echo "changelog=$changelog" >> $GITHUB_OUTPUT
+          {
+            echo "changelog<<EOF"
+            echo "$changelog"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
