@@ -1,0 +1,171 @@
+name: 📦 Nuget package publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Perform a dry run (pack only, no push or release)'
+        required: false
+        default: true
+        type: boolean
+
+env:
+   NUGET_TOKEN: ${{ secrets.NUGET_TOKEN }}
+
+jobs:
+
+  nuget:
+    name: 📦 Nuget - Publish package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      # 🛒 Checkout the repository
+      - name: 🛒 Checkout
+        uses: actions/checkout@v4
+
+      # 🔍 Extract Version from Directory.Build.props
+      - name: 🔍 Extract Version
+        id: extract_version
+        run: |
+          # Directory.Build.props
+          if [ ! -f 'Directory.Build.props' ]; then
+            echo "::error::Directory.Build.props file not found."
+            exit 1
+          fi
+
+          # Extract AssemblyVersion
+          assemblyVersion=$(grep -oP '(?<=<AssemblyVersion>).*?(?=</AssemblyVersion>)' Directory.Build.props || true)
+
+          # Extract Version
+          version=$(grep -oP '(?<=<Version>).*?(?=</Version>)' Directory.Build.props || true)
+
+          # If Version not found, use AssemblyVersion
+          if [ -z "$version" ]; then
+            version="$assemblyVersion"
+          fi
+
+          if [ -n "$assemblyVersion" ]; then
+            # Replace $(AssemblyVersion) in version with the value of assemblyVersion
+            version=$(echo "$version" | sed "s/\$(AssemblyVersion)/$assemblyVersion/g")  
+          fi
+
+          # Ensure version is valid
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.?[0-9]+)?)?$ ]]; then
+            echo "::error::Invalid version format in Directory.Build.props: $version"
+            exit 1
+          fi
+
+          echo "Version=$version" >> $GITHUB_ENV
+          echo "Extracted and Resolved AssemblyVersion: $assemblyVersion"
+          echo "Extracted and Resolved Version: $version"
+
+      # 📝 Parse changelog for the version
+      - name: 📝 Parse changelog
+        id: parse_changelog
+        run: |
+          version="${{ env.Version }}"
+          echo "Looking for version: $version"
+
+          if [ ! -f "CHANGELOG.md" ]; then
+            echo "::error::CHANGELOG.md not found."
+            exit 1
+          fi
+
+          # Create pattern that matches:
+          # - Normal versions: # v1.1.1 (24/05/2025)
+          # - Prerelease versions: # v1.1.1-beta.1 (24/05/2025) or # v1.1.1-rc (24/05/2025)
+          version_pattern="^# v?${version//./\\.}(-[a-zA-Z]+(\.?[0-9]+)?)? \([0-9]{2}/[0-9]{2}/[0-9]{4}\)$"
+          echo "Using pattern: '$version_pattern'"
+
+          # Debug: Show matching lines
+          echo "Matching lines in CHANGELOG.md:"
+          grep -En "$version_pattern" CHANGELOG.md || echo "No matches found"
+
+          # Find the line number using extended regex
+          start_line=$(grep -En "$version_pattern" CHANGELOG.md | cut -d: -f1)
+
+          if [ -z "$start_line" ]; then
+            echo "::error::Could not find version $version in CHANGELOG.md"
+            echo "First few lines of CHANGELOG.md:"
+            head -n 5 CHANGELOG.md
+            exit 1
+          fi
+
+          # Find next version header (with prerelease support)
+          next_version_pattern="^# v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z]+(\.[0-9]+)?)? "
+          next_version_line=$(tail -n +$((start_line+1)) CHANGELOG.md | grep -En -m 1 "$next_version_pattern" | cut -d: -f1)
+
+          if [ -z "$next_version_line" ]; then
+            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md)
+          else
+            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md | head -n $((next_version_line-1)))
+          fi
+
+          # Clean up the changelog content
+          changelog=$(echo "$changelog" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+
+          if [ -z "$changelog" ]; then
+            echo "::error::Empty changelog for version $version"
+            exit 1
+          fi
+
+          echo "Extracted changelog content:"
+          echo "---"
+          echo "$changelog"
+          echo "---"
+
+          # Use heredoc to properly handle multi-line content
+          delimiter="EOF_$(openssl rand -hex 8)"
+          echo "Changelog<<${delimiter}" >> $GITHUB_ENV
+          echo "$changelog" >> $GITHUB_ENV
+          echo "${delimiter}" >> $GITHUB_ENV
+
+      # 🟣 Setup .NET
+      - name: 🟣 Setup .NET 10.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # 📦 Pack the project
+      - name: 📦 Pack
+        run: dotnet pack --configuration Release --output .
+
+      # 🏷️ Create a Git tag
+      - name: 🏷️ Create Git tag
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ env.Version }}" -m "Release v${{ env.Version }}"
+          git push origin "v${{ env.Version }}"
+
+      # 🚀 Push to nuget.org
+      - name: 🚀 Push nuget.org
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: dotnet nuget push *.nupkg --source https://api.nuget.org/v3/index.json --api-key ${NUGET_TOKEN} --skip-duplicate
+
+      # 🚀 Push to GitHub Packages
+      - name: 🚀 Push Github
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: dotnet nuget push *.nupkg --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json --api-key ${{ github.token }} --skip-duplicate
+
+      # 📝 Create GitHub release
+      - name: 📝 Create GitHub release
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ env.Version }}"
+          name: "v${{ env.Version }}"
+          body: ${{ env.Changelog }}
+          draft: false
+          prerelease: ${{ contains(env.Version, '-alpha') || contains(env.Version, '-beta') || contains(env.Version, '-preview') || contains(env.Version, '-rc') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Show dry run message if enabled
+      - name: 🛑 Dry run notice
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: echo "Dry run completed. Package was built but not published."

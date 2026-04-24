@@ -46,7 +46,7 @@ jobs:
           # Extract Version
           version=$(grep -oP '(?<=<Version>).*?(?=</Version>)' "$project_file" || true)
 
-          if [ -z "$version" -a -z "$assemblyVersion" ]; then
+          if [ -z "$version" ] && [ -z "$assemblyVersion" ]; then
             echo "::error::Unable to extract the project version from $project_file."
             exit 1
           fi
@@ -57,7 +57,7 @@ jobs:
           fi
 
           # Replace $(AssemblyVersion) varname in version with the value of assemblyVersion
-          if [ ! -z "$assemblyVersion" ]; then
+          if [ -n "$assemblyVersion" ]; then
             version=$(echo "$version" | sed "s/\$(AssemblyVersion)/$assemblyVersion/g")
           fi
 
@@ -75,8 +75,13 @@ jobs:
       - name: 📝 Parse changelog
         id: parse_changelog
         run: |
-          version=${{ steps.extract_version.outputs.version }}
+          version="${{ steps.extract_version.outputs.version }}"
           echo "Looking for version: $version"
+
+          if [ ! -f "CHANGELOG.md" ]; then
+            echo "::error::CHANGELOG.md not found."
+            exit 1
+          fi
 
           # Create pattern that matches:
           # - Normal versions: # v1.1.1 (24/05/2025)
