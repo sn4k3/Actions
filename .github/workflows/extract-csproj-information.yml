@@ -1,134 +1,150 @@
-name: Extract Release Information
+name: Extract release information
 
 on:
   workflow_call:
     inputs:
       csproj-path:
-        description: "Path to the .csproj or .props file (defaults to Directory.Build.props)"
+        description: Path to the .csproj or .props file
         required: false
-        default: "Directory.Build.props"
+        default: Directory.Build.props
         type: string
-        
     outputs:
       version:
-        description: "The extracted version number"
+        description: The resolved package version
         value: ${{ jobs.extract_information.outputs.version }}
       changelog:
-        description: "The extracted changelog content"
+        description: The changelog entry for the resolved version
         value: ${{ jobs.extract_information.outputs.changelog }}
+
+permissions:
+  contents: read
 
 jobs:
   extract_information:
-    name: '🔍 Extract csproj information'
+    name: Extract release information
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      version: ${{ steps.extract_version.outputs.version }}
-      changelog: ${{ steps.parse_changelog.outputs.changelog }}
+      version: ${{ steps.extract.outputs.version }}
+      changelog: ${{ steps.extract.outputs.changelog }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      # 🔍 Extract Version from project file
-      - name: 🔍 Extract Version
-        id: extract_version
+      - name: Extract version and changelog
+        id: extract
+        shell: bash
+        env:
+          PROJECT_FILE: ${{ inputs.csproj-path }}
         run: |
-          project_file="${{ inputs.csproj-path }}"
-          echo "Looking for version in: $project_file"
+          set -euo pipefail
 
-          # Check for project file
-          if [ ! -f "$project_file" ]; then
-            echo "::error::$project_file file not found."
-            exit 1
-          fi
+          python3 - <<'PY'
+          import os
+          import re
+          import uuid
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
 
-          # Extract AssemblyVersion
-          assemblyVersion=$(grep -oP '(?<=<AssemblyVersion>).*?(?=</AssemblyVersion>)' "$project_file" || true)
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          project_file = (workspace / os.environ["PROJECT_FILE"]).resolve()
 
-          # Extract Version
-          version=$(grep -oP '(?<=<Version>).*?(?=</Version>)' "$project_file" || true)
+          try:
+              project_file.relative_to(workspace)
+          except ValueError:
+              raise SystemExit(f"::error::Project file must be inside the workspace: {project_file}")
 
-          if [ -z "$version" ] && [ -z "$assemblyVersion" ]; then
-            echo "::error::Unable to extract the project version from $project_file."
-            exit 1
-          fi
+          if not project_file.is_file():
+              raise SystemExit(f"::error::Project file not found: {project_file}")
 
-          # If Version not found, use AssemblyVersion
-          if [ -z "$version" ]; then
-            version="$assemblyVersion"
-          fi
+          try:
+              root = ET.parse(project_file).getroot()
+          except ET.ParseError as error:
+              raise SystemExit(f"::error::Invalid project XML in {project_file}: {error}") from error
 
-          # Replace $(AssemblyVersion) varname in version with the value of assemblyVersion
-          if [ -n "$assemblyVersion" ]; then
-            version=$(echo "$version" | sed "s/\$(AssemblyVersion)/$assemblyVersion/g")
-          fi
+          properties = {}
+          for element in root.iter():
+              name = element.tag.rsplit("}", 1)[-1]
+              value = (element.text or "").strip()
+              if value and name not in properties:
+                  properties[name] = value
 
-          # Ensure version is valid
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+(\.?[0-9]+)?)?$ ]]; then
-            echo "::error::Invalid version format in $project_file: $version"
-            exit 1
-          fi
+          raw_version = properties.get("Version")
+          if not raw_version and properties.get("VersionPrefix"):
+              raw_version = properties["VersionPrefix"]
+              if properties.get("VersionSuffix"):
+                  raw_version += f"-{properties['VersionSuffix']}"
+          raw_version = raw_version or properties.get("AssemblyVersion")
 
-          echo "Extracted and Resolved AssemblyVersion: $assemblyVersion"
-          echo "Extracted and Resolved Version: $version"
-          echo "version=$version" >> $GITHUB_OUTPUT
+          if not raw_version:
+              raise SystemExit(
+                  f"::error::No Version, VersionPrefix, or AssemblyVersion was found in {project_file}"
+              )
 
-      # 📝 Parse changelog for the version
-      - name: 📝 Parse changelog
-        id: parse_changelog
-        run: |
-          version="${{ steps.extract_version.outputs.version }}"
-          echo "Looking for version: $version"
+          property_reference = re.compile(r"\$\(([^)]+)\)")
+          version = raw_version
+          for _ in range(10):
+              expanded = property_reference.sub(
+                  lambda match: properties.get(match.group(1), match.group(0)), version
+              )
+              if expanded == version:
+                  break
+              version = expanded
 
-          if [ ! -f "CHANGELOG.md" ]; then
-            echo "::error::CHANGELOG.md not found."
-            exit 1
-          fi
+          unresolved = property_reference.findall(version)
+          if unresolved:
+              names = ", ".join(sorted(set(unresolved)))
+              raise SystemExit(f"::error::Unresolved MSBuild properties in version: {names}")
 
-          # Create pattern that matches:
-          # - Normal versions: # v1.1.1 (24/05/2025)
-          # - Prerelease versions: # v1.1.1-beta.1 (24/05/2025) or # v1.1.1-rc (24/05/2025)
-          version_pattern="^# v?${version//./\\.}(-[a-zA-Z]+(\.?[0-9]+)?)? \([0-9]{2}/[0-9]{2}/[0-9]{4}\)$"
-          echo "Using pattern: '$version_pattern'"
+          nuget_version = re.compile(
+              r"^[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          if not nuget_version.fullmatch(version):
+              raise SystemExit(f"::error::Invalid NuGet version in {project_file}: {version}")
 
-          # Debug: Show matching lines
-          echo "Matching lines in CHANGELOG.md:"
-          grep -En "$version_pattern" CHANGELOG.md || echo "No matches found"
+          changelog_file = workspace / "CHANGELOG.md"
+          if not changelog_file.is_file():
+              raise SystemExit("::error::CHANGELOG.md not found")
 
-          # Find the line number using extended regex
-          start_line=$(grep -En "$version_pattern" CHANGELOG.md | cut -d: -f1)
+          lines = changelog_file.read_text(encoding="utf-8-sig").splitlines()
+          escaped_version = re.escape(version)
+          version_header = re.compile(
+              rf"^#{{1,6}}\s+\[?v?{escaped_version}\]?"
+              rf"(?:\s+(?:\([^)]+\)|-\s+\d{{4}}-\d{{2}}-\d{{2}}))?\s*$"
+          )
+          any_version_header = re.compile(
+              r"^#{1,6}\s+\[?v?[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?"
+              r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\]?"
+              r"(?:\s|$)"
+          )
 
-          if [ -z "$start_line" ]; then
-            echo "::error::Could not find version $version in CHANGELOG.md"
-            echo "First few lines of CHANGELOG.md:"
-            head -n 5 CHANGELOG.md
-            exit 1
-          fi
+          matches = [index for index, line in enumerate(lines) if version_header.fullmatch(line)]
+          if not matches:
+              raise SystemExit(f"::error::Could not find version {version} in CHANGELOG.md")
+          if len(matches) > 1:
+              raise SystemExit(f"::error::Found multiple changelog headings for version {version}")
 
-          # Find next version header (with prerelease support)
-          next_version_pattern="^# v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z]+(\.[0-9]+)?)? "
-          next_version_line=$(tail -n +$((start_line+1)) CHANGELOG.md | grep -En -m 1 "$next_version_pattern" | cut -d: -f1)
+          start = matches[0] + 1
+          end = next(
+              (index for index in range(start, len(lines)) if any_version_header.match(lines[index])),
+              len(lines),
+          )
+          changelog = "\n".join(lines[start:end]).strip()
+          if not changelog:
+              raise SystemExit(f"::error::Empty changelog for version {version}")
 
-          if [ -z "$next_version_line" ]; then
-            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md)
-          else
-            changelog=$(tail -n +$((start_line+1)) CHANGELOG.md | head -n $((next_version_line-1)))
-          fi
+          output_file = Path(os.environ["GITHUB_OUTPUT"])
+          delimiter = f"changelog_{uuid.uuid4().hex}"
+          with output_file.open("a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+              output.write(f"changelog<<{delimiter}\n{changelog}\n{delimiter}\n")
 
-          # Clean up the changelog content
-          changelog=$(echo "$changelog" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}')
-
-          if [ -z "$changelog" ]; then
-            echo "::error::Empty changelog for version $version"
-            exit 1
-          fi
-
-          echo "Extracted changelog content:"
-          echo "---"
-          echo "$changelog"
-          echo "---"
-
-          # Escape newlines and quotes for proper JSON output
-          {
-            echo "changelog<<EOF"
-            echo "$changelog"
-            echo "EOF"
-          } >> $GITHUB_OUTPUT
+          print(f"Resolved version: {version}")
+          print("Extracted changelog entry:")
+          print(changelog)
+          PY
